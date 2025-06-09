@@ -97,51 +97,84 @@ class YouTubeDataProcessor:
                 'total_video_count': int(channel_info['statistics']['videoCount']),
                 'view_count': int(channel_info['statistics']['viewCount'])
             }
+            channel_metadata.append(channel_data)
             
             # Extract video data from all time periods
-            for period, videos in metrics.items():
-                if isinstance(videos, dict) and 'videos' in videos:
-                    for video in videos['videos']:
+            for period, period_data in metrics.items():
+                if isinstance(period_data, dict) and 'videos' in period_data:
+                    for video in period_data['videos']:
                         duration_minutes = self._parse_duration(video.get('duration', 'PT0S'))
+                        views = int(video['statistics'].get('viewCount', 0))
+                        likes = int(video['statistics'].get('likeCount', 0))
+                        comments = int(video['statistics'].get('commentCount', 0))
+                        shares = int(video['statistics'].get('shareCount', 0))
+                        
+                        # Calculate per-video engagement rate
+                        video_engagement = likes + comments + shares
+                        video_engagement_rate = (video_engagement / views * 100) if views > 0 else 0
+                        
                         video_data = {
                             'channel_id': channel_info['id'],
                             'channel_name': channel_info['snippet']['title'],
                             'video_id': video['id'],
                             'title': video['snippet']['title'],
                             'published_at': pd.to_datetime(video['snippet']['publishedAt']),
-                            'views': int(video['statistics'].get('viewCount', 0)),
-                            'likes': int(video['statistics'].get('likeCount', 0)),
-                            'comments': int(video['statistics'].get('commentCount', 0)),
+                            'views': views,
+                            'likes': likes,
+                            'comments': comments,
+                            'shares': shares,
+                            'engagement': video_engagement,
+                            'engagement_rate': video_engagement_rate,
                             'duration_minutes': duration_minutes,
                             'period': period
                         }
                         all_videos.append(video_data)
-            
-            channel_metadata.append(channel_data)
         
         # Create DataFrames
         videos_df = pd.DataFrame(all_videos)
         channels_df = pd.DataFrame(channel_metadata)
         
+        # Calculate channel-level engagement metrics
+        channel_engagement = []
+        for _, channel in channels_df.iterrows():
+            channel_videos = videos_df[videos_df['channel_id'] == channel['channel_id']]
+            total_engagement = channel_videos['engagement'].sum()
+            
+            # Calculate both channel-level engagement rates
+            engagement_per_video = total_engagement / len(channel_videos) if len(channel_videos) > 0 else 0
+            engagement_per_subscriber = (total_engagement / channel['subscriber_count'] * 100) if channel['subscriber_count'] > 0 else 0
+            
+            channel_engagement.append({
+                'channel_id': channel['channel_id'],
+                'channel_name': channel['channel_name'],
+                'total_engagement': total_engagement,
+                'engagement_per_video': engagement_per_video,
+                'engagement_per_subscriber': engagement_per_subscriber,
+                'avg_video_engagement_rate': channel_videos['engagement_rate'].mean()
+            })
+        
+        engagement_df = pd.DataFrame(channel_engagement)
+        
         # Calculate upload frequency for each channel
         channel_frequencies = []
         for channel_id in videos_df['channel_id'].unique():
             channel_videos = videos_df[videos_df['channel_id'] == channel_id]
-            first_video = channel_videos['published_at'].min()
-            last_video = channel_videos['published_at'].max()
-            days_between = (last_video - first_video).days
-            total_videos = len(channel_videos)
-            frequency = days_between / (total_videos - 1) if total_videos > 1 else 0
-            
-            channel_frequencies.append({
-                'channel_id': channel_id,
-                'channel_name': channel_videos['channel_name'].iloc[0],
-                'first_video_date': first_video,
-                'last_video_date': last_video,
-                'days_between': days_between,
-                'total_videos': total_videos,
-                'upload_frequency': frequency
-            })
+            if len(channel_videos) >= 2:
+                first_video = channel_videos['published_at'].min()
+                last_video = channel_videos['published_at'].max()
+                days_between = (last_video - first_video).days
+                total_videos = len(channel_videos)
+                frequency = days_between / (total_videos - 1) if total_videos > 1 else 0
+                
+                channel_frequencies.append({
+                    'channel_id': channel_id,
+                    'channel_name': channel_videos['channel_name'].iloc[0],
+                    'first_video_date': first_video,
+                    'last_video_date': last_video,
+                    'days_between': days_between,
+                    'total_videos': total_videos,
+                    'upload_frequency': frequency
+                })
         
         frequency_df = pd.DataFrame(channel_frequencies)
         
@@ -177,39 +210,55 @@ class YouTubeDataProcessor:
         video_metrics = {
             'views': 'Views per Video',
             'likes': 'Likes per Video',
-            'comments': 'Comments per Video'
+            'comments': 'Comments per Video',
+            'shares': 'Shares per Video',
+            'engagement_rate': 'Engagement Rate per Video (%)'
         }
         
         for col, label in video_metrics.items():
             stats = videos_df[col].agg(['mean', 'median', 'min', 'max'])
-            stats_table.append(f"| {label} | {stats['mean']:,.0f} | {stats['median']:,.0f} | {stats['min']:,.0f} | {stats['max']:,.0f} |")
-        
-        # Calculate engagement rate (likes + comments) / subscribers * 100
-        videos_df['engagement_rate'] = (videos_df['likes'] + videos_df['comments']) / videos_df['subscriber_count'].replace(0, 1) * 100
-        engagement_stats = videos_df['engagement_rate'].agg(['mean', 'median', 'min', 'max'])
-        stats_table.append(f"| Engagement Rate (%) | {engagement_stats['mean']:.2f} | {engagement_stats['median']:.2f} | {engagement_stats['min']:.2f} | {engagement_stats['max']:.2f} |")
+            if 'rate' in col:
+                stats_table.append(f"| {label} | {stats['mean']:.2f} | {stats['median']:.2f} | {stats['min']:.2f} | {stats['max']:.2f} |")
+            else:
+                stats_table.append(f"| {label} | {stats['mean']:,.0f} | {stats['median']:,.0f} | {stats['min']:,.0f} | {stats['max']:,.0f} |")
         
         report.extend(stats_table)
         
-        # Upload Frequency Analysis
-        report.append("\n### Upload Frequency Analysis")
-        freq_table = []
-        freq_table.append("| Channel | First Video | Last Video | Days Between | Total Videos | Avg. Days Between Videos |")
-        freq_table.append("|---------|-------------|------------|--------------|--------------|-------------------------|")
+        # Channel Engagement Analysis
+        report.append("\n### Channel Engagement Analysis")
+        engagement_table = []
+        engagement_table.append("| Channel | Total Engagement | Engagement per Video | Engagement per Subscriber (%) | Avg. Video Engagement Rate (%) |")
+        engagement_table.append("|---------|-----------------|---------------------|-----------------------------|-------------------------------|")
         
-        for _, row in frequency_df.iterrows():
-            freq_table.append(
-                f"| {row['channel_name']} | {row['first_video_date'].strftime('%Y-%m-%d')} | "
-                f"{row['last_video_date'].strftime('%Y-%m-%d')} | {row['days_between']:,.0f} | "
-                f"{row['total_videos']:,.0f} | {row['upload_frequency']:.1f} |"
+        for _, row in engagement_df.iterrows():
+            engagement_table.append(
+                f"| {row['channel_name']} | {row['total_engagement']:,.0f} | {row['engagement_per_video']:,.0f} | "
+                f"{row['engagement_per_subscriber']:.2f} | {row['avg_video_engagement_rate']:.2f} |"
             )
         
-        report.extend(freq_table)
+        report.extend(engagement_table)
+        
+        # Upload Frequency Analysis
+        if not frequency_df.empty:
+            report.append("\n### Upload Frequency Analysis")
+            freq_table = []
+            freq_table.append("| Channel | First Video | Last Video | Days Between | Total Videos | Avg. Days Between Videos |")
+            freq_table.append("|---------|-------------|------------|--------------|--------------|-------------------------|")
+            
+            for _, row in frequency_df.iterrows():
+                freq_table.append(
+                    f"| {row['channel_name']} | {row['first_video_date'].strftime('%Y-%m-%d')} | "
+                    f"{row['last_video_date'].strftime('%Y-%m-%d')} | {row['days_between']:,.0f} | "
+                    f"{row['total_videos']:,.0f} | {row['upload_frequency']:.1f} |"
+                )
+            
+            report.extend(freq_table)
         
         # Channel-specific Analysis
         report.append("\n## Channel-specific Analysis")
         for _, channel in channels_df.iterrows():
             channel_videos = videos_df[videos_df['channel_id'] == channel['channel_id']]
+            channel_eng = engagement_df[engagement_df['channel_id'] == channel['channel_id']].iloc[0]
             
             report.append(f"\n### {channel['channel_name']}")
             report.append(f"- Channel ID: {channel['channel_id']}")
@@ -222,11 +271,14 @@ class YouTubeDataProcessor:
             report.append(f"- Average Views: {channel_videos['views'].mean():,.0f}")
             report.append(f"- Average Likes: {channel_videos['likes'].mean():,.0f}")
             report.append(f"- Average Comments: {channel_videos['comments'].mean():,.0f}")
+            report.append(f"- Average Shares: {channel_videos['shares'].mean():,.0f}")
+            report.append(f"- Average Video Engagement Rate: {channel_videos['engagement_rate'].mean():.2f}%")
             
-            # Calculate channel-specific engagement rate
-            total_engagement = channel_videos['likes'].sum() + channel_videos['comments'].sum()
-            engagement_rate = (total_engagement / channel['subscriber_count']) * 100 if channel['subscriber_count'] > 0 else 0
-            report.append(f"- Engagement Rate: {engagement_rate:.2f}%")
+            # Channel engagement metrics
+            report.append("\n#### Channel Engagement")
+            report.append(f"- Total Engagement (likes + comments + shares): {channel_eng['total_engagement']:,.0f}")
+            report.append(f"- Average Engagement per Video: {channel_eng['engagement_per_video']:,.0f}")
+            report.append(f"- Engagement Rate per Subscriber: {channel_eng['engagement_per_subscriber']:.2f}%")
             
             # Channel-specific duration analysis
             duration_stats = channel_videos['duration_minutes'].agg(['mean', 'median', 'min', 'max'])
@@ -237,11 +289,14 @@ class YouTubeDataProcessor:
             report.append(f"- Longest Video: {duration_stats['max']:.1f} minutes")
             
             # Upload frequency
-            channel_freq = frequency_df[frequency_df['channel_id'] == channel['channel_id']].iloc[0]
-            report.append(f"\n#### Upload Frequency")
-            report.append(f"- First Video: {channel_freq['first_video_date'].strftime('%Y-%m-%d')}")
-            report.append(f"- Last Video: {channel_freq['last_video_date'].strftime('%Y-%m-%d')}")
-            report.append(f"- Average Days Between Videos: {channel_freq['upload_frequency']:.1f}")
+            if not frequency_df.empty:
+                channel_freq = frequency_df[frequency_df['channel_id'] == channel['channel_id']]
+                if not channel_freq.empty:
+                    freq_row = channel_freq.iloc[0]
+                    report.append(f"\n#### Upload Frequency")
+                    report.append(f"- First Video: {freq_row['first_video_date'].strftime('%Y-%m-%d')}")
+                    report.append(f"- Last Video: {freq_row['last_video_date'].strftime('%Y-%m-%d')}")
+                    report.append(f"- Average Days Between Videos: {freq_row['upload_frequency']:.1f}")
         
         # Save the report
         report_path = os.path.join(output_dir, 'channel_analysis_report.md')
@@ -251,9 +306,10 @@ class YouTubeDataProcessor:
         # Save raw data as CSV for further analysis
         videos_df.to_csv(os.path.join(output_dir, 'video_analysis.csv'), index=False)
         channels_df.to_csv(os.path.join(output_dir, 'channel_analysis.csv'), index=False)
+        engagement_df.to_csv(os.path.join(output_dir, 'channel_engagement.csv'), index=False)
         
         print(f"\nAnalysis report saved to: {report_path}")
-        print(f"Raw data saved to: {os.path.join(output_dir, 'video_analysis.csv')} and {os.path.join(output_dir, 'channel_analysis.csv')}")
+        print(f"Raw data saved to: {os.path.join(output_dir, 'video_analysis.csv')}, {os.path.join(output_dir, 'channel_analysis.csv')}, and {os.path.join(output_dir, 'channel_engagement.csv')}")
 
     def _plot_channel_overview(self, df: pd.DataFrame, output_dir: str):
         """Generate channel overview visualizations."""

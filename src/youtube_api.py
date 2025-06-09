@@ -63,38 +63,64 @@ class YouTubeDataScraper:
             self.logger.error(f"Error getting channel info for {channel_id}: {str(e)}")
             raise
 
-    def get_channel_videos(self, playlist_id: str, max_results: int = 50) -> List[Dict]:
-        """Get videos from a channel's upload playlist."""
-        videos = []
-        next_page_token = None
-
+    def get_channel_videos(self, channel_id: str, max_results: int = 50) -> dict:
+        """Get videos from a channel with their statistics."""
         try:
+            # First get channel's uploads playlist ID
+            channel_response = self.youtube.channels().list(
+                part='contentDetails',
+                id=channel_id
+            ).execute()
+            
+            if not channel_response['items']:
+                self.logger.warning(f"No channel found with ID: {channel_id}")
+                return {}
+            
+            uploads_playlist_id = channel_response['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+            
+            # Get videos from the uploads playlist
+            videos = []
+            next_page_token = None
+            
             while len(videos) < max_results:
-                request = self.youtube.playlistItems().list(
-                    part="snippet,contentDetails",
-                    playlistId=playlist_id,
+                playlist_response = self.youtube.playlistItems().list(
+                    part='snippet,contentDetails',
+                    playlistId=uploads_playlist_id,
                     maxResults=min(50, max_results - len(videos)),
                     pageToken=next_page_token
-                )
-                response = request.execute()
-
-                for item in response['items']:
-                    video_id = item['contentDetails']['videoId']
-                    video_details = self.get_video_details(video_id)
-                    if video_details:
-                        videos.append(video_details)
-
-                next_page_token = response.get('nextPageToken')
+                ).execute()
+                
+                video_ids = [item['contentDetails']['videoId'] for item in playlist_response['items']]
+                
+                # Get detailed video statistics including share count
+                video_response = self.youtube.videos().list(
+                    part='snippet,statistics,contentDetails',
+                    id=','.join(video_ids)
+                ).execute()
+                
+                for video in video_response['items']:
+                    video_data = {
+                        'id': video['id'],
+                        'snippet': video['snippet'],
+                        'statistics': {
+                            'viewCount': video['statistics'].get('viewCount', '0'),
+                            'likeCount': video['statistics'].get('likeCount', '0'),
+                            'commentCount': video['statistics'].get('commentCount', '0'),
+                            'shareCount': video['statistics'].get('shareCount', '0'),  # Added share count
+                        },
+                        'duration': video['contentDetails'].get('duration', 'PT0S')
+                    }
+                    videos.append(video_data)
+                
+                next_page_token = playlist_response.get('nextPageToken')
                 if not next_page_token:
                     break
-
-                # Respect API quota limits
-                time.sleep(self.config['youtube_api']['retry_delay'])
-
-        except HttpError as e:
-            self.logger.error(f"Error fetching videos: {e}")
-
-        return videos
+            
+            return {'videos': videos}
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching videos for channel {channel_id}: {str(e)}")
+            return {}
 
     def get_video_details(self, video_id: str) -> Optional[Dict]:
         """Get detailed information about a specific video."""
@@ -146,7 +172,7 @@ class YouTubeDataScraper:
 
         # Get all videos
         videos = self.get_channel_videos(
-            channel_info['contentDetails']['relatedPlaylists']['uploads'],
+            channel_id,
             max_results=100  # Adjust based on needs
         )
 
@@ -154,12 +180,12 @@ class YouTubeDataScraper:
         now = datetime.now(timezone.utc)  # Make timezone-aware
         six_months_ago = now - timedelta(days=180)
 
-        recent_videos = videos[:self.config['analysis']['recent_videos_count']]
+        recent_videos = videos['videos'][:self.config['analysis']['recent_videos_count']]
         six_month_videos = [
-            v for v in videos 
-            if datetime.fromisoformat(v['published_at'].replace('Z', '+00:00')) > six_months_ago
+            v for v in videos['videos'] 
+            if datetime.fromisoformat(v['snippet']['publishedAt'].replace('Z', '+00:00')) > six_months_ago
         ]
-        all_time_videos = videos
+        all_time_videos = videos['videos']
 
         analysis = {
             'channel_info': channel_info,
@@ -177,17 +203,17 @@ class YouTubeDataScraper:
         if not videos:
             return {}
 
-        total_views = sum(v['view_count'] for v in videos)
-        total_likes = sum(v['like_count'] for v in videos)
-        total_comments = sum(v['comment_count'] for v in videos)
-        total_duration = sum(v['duration'] for v in videos)
+        total_views = sum(int(v['statistics']['viewCount']) for v in videos)
+        total_likes = sum(int(v['statistics']['likeCount']) for v in videos)
+        total_comments = sum(int(v['statistics']['commentCount']) for v in videos)
+        total_duration = sum(self._parse_duration(v['duration']) for v in videos)
         
         video_count = len(videos)
         
         # Calculate upload frequency
         if len(videos) >= 2:
-            first_video_date = datetime.fromisoformat(videos[-1]['published_at'].replace('Z', '+00:00'))
-            last_video_date = datetime.fromisoformat(videos[0]['published_at'].replace('Z', '+00:00'))
+            first_video_date = datetime.fromisoformat(videos[-1]['snippet']['publishedAt'].replace('Z', '+00:00'))
+            last_video_date = datetime.fromisoformat(videos[0]['snippet']['publishedAt'].replace('Z', '+00:00'))
             days_between = (last_video_date - first_video_date).days
             upload_frequency = days_between / (video_count - 1) if days_between > 0 else 0
         else:
