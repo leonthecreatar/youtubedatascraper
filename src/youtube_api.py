@@ -200,7 +200,7 @@ class YouTubeDataScraper:
             'average_comments': total_comments / video_count if video_count > 0 else 0,
             'average_duration': total_duration / video_count if video_count > 0 else 0,
             'engagement_rate': (total_likes + total_comments) / total_views if total_views > 0 else 0,
-            'upload_frequency_days': upload_frequency
+            'upload_frequency': upload_frequency
         }
 
     def get_channel_id_from_handle(self, handle: str) -> Optional[str]:
