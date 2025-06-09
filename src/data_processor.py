@@ -67,22 +67,24 @@ class YouTubeDataProcessor:
         """Generate a detailed analysis report in Markdown format."""
         os.makedirs(output_dir, exist_ok=True)
         
+        # Debug: Print DataFrame columns
+        print("\nAvailable DataFrame columns:")
+        print(df.columns.tolist())
+        print("\nDataFrame head:")
+        print(df.head())
+        
         # Start building the report
         report = []
         report.append("# YouTube Channel Analysis Report\n")
         report.append(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         
-        # Print available columns for debugging
-        report.append("## Available Data Columns")
-        report.append("```")
-        report.append(", ".join(df.columns.tolist()))
-        report.append("```\n")
-        
         # Channel Overview
         report.append("## Channel Overview")
-        report.append(f"- Total Videos: {df['total_videos'].sum():,.0f}")
+        # Use len(df) for total videos since we have one row per channel
+        report.append(f"- Total Channels Analyzed: {len(df)}")
+        report.append(f"- Total Videos: {df['total_video_count'].sum():,.0f}")  # Updated column name
         report.append(f"- Total Subscribers: {df['subscriber_count'].sum():,.0f}")
-        report.append(f"- Total Views: {df['total_views'].sum():,.0f}")
+        report.append(f"- Total Views: {df['view_count'].sum():,.0f}")  # Updated column name
         
         # Basic Statistics
         report.append("\n## Basic Statistics")
@@ -90,13 +92,13 @@ class YouTubeDataProcessor:
         stats_table.append("| Metric | Average | Median | Min | Max |")
         stats_table.append("|--------|---------|--------|-----|-----|")
         
-        # Define metrics to analyze
+        # Define metrics to analyze with correct column names
         metrics = {
             'average_views': 'Average Views',
             'average_likes': 'Average Likes',
             'average_comments': 'Average Comments',
             'engagement_rate': 'Engagement Rate',
-            'upload_frequency_days': 'Upload Frequency (days)'
+            'upload_frequency': 'Upload Frequency (days)'  # Updated column name
         }
         
         for col, label in metrics.items():
@@ -104,7 +106,7 @@ class YouTubeDataProcessor:
                 stats = df[col].agg(['mean', 'median', 'min', 'max'])
                 if col == 'engagement_rate':
                     stats_table.append(f"| {label} | {stats['mean']:.2%} | {stats['median']:.2%} | {stats['min']:.2%} | {stats['max']:.2%} |")
-                elif col == 'upload_frequency_days':
+                elif col == 'upload_frequency':
                     stats_table.append(f"| {label} | {stats['mean']:.1f} | {stats['median']:.1f} | {stats['min']:.1f} | {stats['max']:.1f} |")
                 else:
                     stats_table.append(f"| {label} | {stats['mean']:,.0f} | {stats['median']:,.0f} | {stats['min']:,.0f} | {stats['max']:,.0f} |")
@@ -117,13 +119,13 @@ class YouTubeDataProcessor:
             report.append(f"\n### {channel['channel_name']}")
             report.append(f"- Channel ID: {channel['channel_id']}")
             report.append(f"- Subscribers: {channel['subscriber_count']:,.0f}")
-            report.append(f"- Total Videos: {channel['total_videos']:,.0f}")
-            report.append(f"- Total Views: {channel['total_views']:,.0f}")
+            report.append(f"- Total Videos: {channel['total_video_count']:,.0f}")  # Updated column name
+            report.append(f"- Total Views: {channel['view_count']:,.0f}")  # Updated column name
             report.append(f"- Average Views: {channel['average_views']:,.0f}")
             report.append(f"- Average Likes: {channel['average_likes']:,.0f}")
             report.append(f"- Average Comments: {channel['average_comments']:,.0f}")
             report.append(f"- Engagement Rate: {channel['engagement_rate']:.2%}")
-            report.append(f"- Upload Frequency: {channel['upload_frequency_days']:.1f} days")
+            report.append(f"- Upload Frequency: {channel['upload_frequency']:.1f} days")  # Updated column name
         
         # Save the report
         report_path = os.path.join(output_dir, 'channel_analysis_report.md')
