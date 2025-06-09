@@ -171,28 +171,51 @@ class YouTubeDataScraper:
             return {}
 
         # Get all videos
-        videos = self.get_channel_videos(
+        videos_data = self.get_channel_videos(
             channel_id,
             max_results=100  # Adjust based on needs
         )
+        
+        if not videos_data or 'videos' not in videos_data:
+            self.logger.warning(f"No videos found for channel {channel_id}")
+            return {}
+
+        videos = videos_data['videos']
+        if not videos:
+            self.logger.warning(f"Empty video list for channel {channel_id}")
+            return {}
 
         # Calculate metrics for different time periods
         now = datetime.now(timezone.utc)  # Make timezone-aware
         six_months_ago = now - timedelta(days=180)
 
-        recent_videos = videos['videos'][:self.config['analysis']['recent_videos_count']]
+        # Sort videos by publish date (newest first)
+        videos.sort(key=lambda x: x['snippet']['publishedAt'], reverse=True)
+
+        # Split videos into time periods
+        recent_videos = videos[:self.config['analysis']['recent_videos_count']]
         six_month_videos = [
-            v for v in videos['videos'] 
+            v for v in videos 
             if datetime.fromisoformat(v['snippet']['publishedAt'].replace('Z', '+00:00')) > six_months_ago
         ]
-        all_time_videos = videos['videos']
+        all_time_videos = videos
 
+        # Calculate metrics for each period
         analysis = {
             'channel_info': channel_info,
             'metrics': {
-                'recent_7_videos': self._calculate_metrics(recent_videos),
-                'last_6_months': self._calculate_metrics(six_month_videos),
-                'all_time': self._calculate_metrics(all_time_videos)
+                'recent_7_videos': {
+                    **self._calculate_metrics(recent_videos),
+                    'videos': recent_videos  # Include actual video data
+                },
+                'last_6_months': {
+                    **self._calculate_metrics(six_month_videos),
+                    'videos': six_month_videos  # Include actual video data
+                },
+                'all_time': {
+                    **self._calculate_metrics(all_time_videos),
+                    'videos': all_time_videos  # Include actual video data
+                }
             }
         }
 

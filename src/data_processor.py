@@ -79,102 +79,192 @@ class YouTubeDataProcessor:
 
     def generate_analysis_report(self, df: pd.DataFrame, output_dir: str):
         """Generate a detailed analysis report in Markdown format."""
+        if df.empty:
+            print("No valid data found to analyze")
+            return
+            
         os.makedirs(output_dir, exist_ok=True)
         
         # Extract all video data from the nested structure
         all_videos = []
         channel_metadata = []
         
-        for _, row in df.iterrows():
-            channel_info = row['channel_info']
-            metrics = row['metrics']
-            
-            # Store channel metadata
-            channel_data = {
-                'channel_id': channel_info['id'],
-                'channel_name': channel_info['snippet']['title'],
-                'subscriber_count': int(channel_info['statistics']['subscriberCount']),
-                'total_video_count': int(channel_info['statistics']['videoCount']),
-                'view_count': int(channel_info['statistics']['viewCount'])
-            }
-            channel_metadata.append(channel_data)
-            
-            # Extract video data from all time periods
-            for period, period_data in metrics.items():
-                if isinstance(period_data, dict) and 'videos' in period_data:
-                    for video in period_data['videos']:
-                        duration_minutes = self._parse_duration(video.get('duration', 'PT0S'))
-                        views = int(video['statistics'].get('viewCount', 0))
-                        likes = int(video['statistics'].get('likeCount', 0))
-                        comments = int(video['statistics'].get('commentCount', 0))
-                        shares = int(video['statistics'].get('shareCount', 0))
+        # Debug print to see the structure
+        print("\nProcessing DataFrame with structure:")
+        print(f"Number of rows: {len(df)}")
+        print(f"Columns: {df.columns.tolist()}")
+        
+        # Process each row in the DataFrame
+        for idx, row in df.iterrows():
+            try:
+                # Extract channel info from the nested structure
+                channel_info = row['channel_info']
+                metrics = row['metrics']
+                
+                # Debug print for first row
+                if idx == 0:
+                    print("\nSample channel_info structure:")
+                    print(f"Keys in channel_info: {channel_info.keys()}")
+                    print("\nSample metrics structure:")
+                    print(f"Keys in metrics: {metrics.keys()}")
+                    # Print the actual content of metrics for debugging
+                    print("\nMetrics content:")
+                    for period, data in metrics.items():
+                        print(f"\n{period}:")
+                        print(f"Type: {type(data)}")
+                        print(f"Keys: {data.keys() if isinstance(data, dict) else 'Not a dict'}")
+                        if isinstance(data, dict) and 'videos' in data:
+                            print(f"Number of videos: {len(data['videos']) if isinstance(data['videos'], list) else 'Not a list'}")
+                            if isinstance(data['videos'], list) and data['videos']:
+                                print("First video keys:", data['videos'][0].keys())
+                
+                # Store channel metadata
+                channel_data = {
+                    'channel_id': channel_info['id'],
+                    'channel_name': channel_info['snippet']['title'],
+                    'subscriber_count': int(channel_info['statistics']['subscriberCount']),
+                    'total_video_count': int(channel_info['statistics']['videoCount']),
+                    'view_count': int(channel_info['statistics']['viewCount'])
+                }
+                channel_metadata.append(channel_data)
+                
+                # Process each time period in metrics
+                for period_name, period_data in metrics.items():
+                    if not isinstance(period_data, dict):
+                        print(f"Skipping {period_name}: not a dictionary")
+                        continue
                         
-                        # Calculate per-video engagement rate
-                        video_engagement = likes + comments + shares
-                        video_engagement_rate = (video_engagement / views * 100) if views > 0 else 0
+                    # Get videos for this period
+                    if 'videos' not in period_data:
+                        print(f"No videos found in {period_name}")
+                        continue
                         
-                        video_data = {
-                            'channel_id': channel_info['id'],
-                            'channel_name': channel_info['snippet']['title'],
-                            'video_id': video['id'],
-                            'title': video['snippet']['title'],
-                            'published_at': pd.to_datetime(video['snippet']['publishedAt']),
-                            'views': views,
-                            'likes': likes,
-                            'comments': comments,
-                            'shares': shares,
-                            'engagement': video_engagement,
-                            'engagement_rate': video_engagement_rate,
-                            'duration_minutes': duration_minutes,
-                            'period': period
-                        }
-                        all_videos.append(video_data)
+                    period_videos = period_data['videos']
+                    if not isinstance(period_videos, list):
+                        print(f"Videos in {period_name} is not a list")
+                        continue
+                        
+                    print(f"\nProcessing {len(period_videos)} videos from {period_name}")
+                    
+                    for video in period_videos:
+                        try:
+                            if not isinstance(video, dict):
+                                print(f"Skipping invalid video in {period_name}")
+                                continue
+                                
+                            # Extract video statistics with safe gets
+                            stats = video.get('statistics', {})
+                            views = int(stats.get('viewCount', 0))
+                            likes = int(stats.get('likeCount', 0))
+                            comments = int(stats.get('commentCount', 0))
+                            shares = int(stats.get('shareCount', 0))
+                            
+                            # Calculate per-video engagement rate
+                            video_engagement = likes + comments + shares
+                            video_engagement_rate = (video_engagement / views * 100) if views > 0 else 0
+                            
+                            # Create video data entry
+                            video_data = {
+                                'channel_id': channel_info['id'],  # Ensure channel_id is included
+                                'channel_name': channel_info['snippet']['title'],
+                                'video_id': video.get('id', ''),
+                                'title': video.get('snippet', {}).get('title', ''),
+                                'published_at': pd.to_datetime(video.get('snippet', {}).get('publishedAt', '')),
+                                'views': views,
+                                'likes': likes,
+                                'comments': comments,
+                                'shares': shares,
+                                'engagement': video_engagement,
+                                'engagement_rate': video_engagement_rate,
+                                'duration_minutes': self._parse_duration(video.get('duration', 'PT0S')),
+                                'period': period_name
+                            }
+                            all_videos.append(video_data)
+                        except (KeyError, ValueError, TypeError) as e:
+                            print(f"Error processing video in {period_name}: {e}")
+                            continue
+            except Exception as e:
+                print(f"Error processing row {idx}: {e}")
+                continue
         
         # Create DataFrames
         videos_df = pd.DataFrame(all_videos)
         channels_df = pd.DataFrame(channel_metadata)
         
+        # Debug print DataFrame info
+        print("\nCreated DataFrames:")
+        print(f"Videos DataFrame shape: {videos_df.shape}")
+        print(f"Videos DataFrame columns: {videos_df.columns.tolist()}")
+        if not videos_df.empty:
+            print("\nFirst few videos:")
+            print(videos_df[['channel_id', 'title', 'views', 'likes', 'comments']].head())
+        print(f"\nChannels DataFrame shape: {channels_df.shape}")
+        print(f"Channels DataFrame columns: {channels_df.columns.tolist()}")
+        
+        if videos_df.empty or channels_df.empty:
+            print("No valid data found to analyze")
+            return
+        
+        # Verify channel_id exists in both DataFrames
+        if 'channel_id' not in videos_df.columns:
+            print("Error: channel_id not found in videos DataFrame")
+            return
+        if 'channel_id' not in channels_df.columns:
+            print("Error: channel_id not found in channels DataFrame")
+            return
+            
         # Calculate channel-level engagement metrics
         channel_engagement = []
         for _, channel in channels_df.iterrows():
-            channel_videos = videos_df[videos_df['channel_id'] == channel['channel_id']]
-            total_engagement = channel_videos['engagement'].sum()
-            
-            # Calculate both channel-level engagement rates
-            engagement_per_video = total_engagement / len(channel_videos) if len(channel_videos) > 0 else 0
-            engagement_per_subscriber = (total_engagement / channel['subscriber_count'] * 100) if channel['subscriber_count'] > 0 else 0
-            
-            channel_engagement.append({
-                'channel_id': channel['channel_id'],
-                'channel_name': channel['channel_name'],
-                'total_engagement': total_engagement,
-                'engagement_per_video': engagement_per_video,
-                'engagement_per_subscriber': engagement_per_subscriber,
-                'avg_video_engagement_rate': channel_videos['engagement_rate'].mean()
-            })
+            try:
+                channel_videos = videos_df[videos_df['channel_id'] == channel['channel_id']]
+                if channel_videos.empty:
+                    continue
+                    
+                total_engagement = channel_videos['engagement'].sum()
+                
+                # Calculate both channel-level engagement rates
+                engagement_per_video = total_engagement / len(channel_videos) if len(channel_videos) > 0 else 0
+                engagement_per_subscriber = (total_engagement / channel['subscriber_count'] * 100) if channel['subscriber_count'] > 0 else 0
+                
+                channel_engagement.append({
+                    'channel_id': channel['channel_id'],
+                    'channel_name': channel['channel_name'],
+                    'total_engagement': total_engagement,
+                    'engagement_per_video': engagement_per_video,
+                    'engagement_per_subscriber': engagement_per_subscriber,
+                    'avg_video_engagement_rate': channel_videos['engagement_rate'].mean()
+                })
+            except Exception as e:
+                print(f"Error calculating engagement for channel {channel['channel_name']}: {e}")
+                continue
         
         engagement_df = pd.DataFrame(channel_engagement)
         
         # Calculate upload frequency for each channel
         channel_frequencies = []
         for channel_id in videos_df['channel_id'].unique():
-            channel_videos = videos_df[videos_df['channel_id'] == channel_id]
-            if len(channel_videos) >= 2:
-                first_video = channel_videos['published_at'].min()
-                last_video = channel_videos['published_at'].max()
-                days_between = (last_video - first_video).days
-                total_videos = len(channel_videos)
-                frequency = days_between / (total_videos - 1) if total_videos > 1 else 0
-                
-                channel_frequencies.append({
-                    'channel_id': channel_id,
-                    'channel_name': channel_videos['channel_name'].iloc[0],
-                    'first_video_date': first_video,
-                    'last_video_date': last_video,
-                    'days_between': days_between,
-                    'total_videos': total_videos,
-                    'upload_frequency': frequency
-                })
+            try:
+                channel_videos = videos_df[videos_df['channel_id'] == channel_id]
+                if len(channel_videos) >= 2:
+                    first_video = channel_videos['published_at'].min()
+                    last_video = channel_videos['published_at'].max()
+                    days_between = (last_video - first_video).days
+                    total_videos = len(channel_videos)
+                    frequency = days_between / (total_videos - 1) if total_videos > 1 else 0
+                    
+                    channel_frequencies.append({
+                        'channel_id': channel_id,
+                        'channel_name': channel_videos['channel_name'].iloc[0],
+                        'first_video_date': first_video,
+                        'last_video_date': last_video,
+                        'days_between': days_between,
+                        'total_videos': total_videos,
+                        'upload_frequency': frequency
+                    })
+            except Exception as e:
+                print(f"Error calculating frequency for channel {channel_id}: {e}")
+                continue
         
         frequency_df = pd.DataFrame(channel_frequencies)
         
