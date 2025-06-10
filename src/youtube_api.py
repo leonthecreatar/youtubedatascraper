@@ -185,12 +185,32 @@ class YouTubeDataScraper:
             self.logger.warning(f"Empty video list for channel {channel_id}")
             return {}
 
+        # Sort videos by publish date (newest first)
+        videos.sort(key=lambda x: x['snippet']['publishedAt'], reverse=True)
+        
+        # Debug print: Show latest 10 videos with their view counts
+        print("\nLatest 10 videos from channel:")
+        print("Title | Views | Published Date")
+        print("-" * 80)
+        for video in videos[:10]:
+            title = video['snippet']['title']
+            views = int(video['statistics'].get('viewCount', 0))
+            published = video['snippet']['publishedAt']
+            print(f"{title[:60]:<60} | {views:,} | {published}")
+        print("-" * 80)
+        
+        # Also print the video with the highest views
+        if videos:
+            max_views_video = max(videos, key=lambda x: int(x['statistics'].get('viewCount', 0)))
+            print("\nVideo with highest views:")
+            print(f"Title: {max_views_video['snippet']['title']}")
+            print(f"Views: {int(max_views_video['statistics'].get('viewCount', 0)):,}")
+            print(f"Published: {max_views_video['snippet']['publishedAt']}")
+            print("-" * 80)
+
         # Calculate metrics for different time periods
         now = datetime.now(timezone.utc)  # Make timezone-aware
         six_months_ago = now - timedelta(days=180)
-
-        # Sort videos by publish date (newest first)
-        videos.sort(key=lambda x: x['snippet']['publishedAt'], reverse=True)
 
         # Split videos into time periods
         recent_videos = videos[:self.config['analysis']['recent_videos_count']]
