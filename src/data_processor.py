@@ -1,7 +1,7 @@
 import json
 import os
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -9,11 +9,17 @@ from pathlib import Path
 import yaml
 import logging
 import re
+import concurrent.futures
+import numpy as np
+from tqdm import tqdm
+from youtube_api import YouTubeDataScraper
+import time
 
 class YouTubeDataProcessor:
     def __init__(self, config_path: str = "config/config.yaml"):
         """Initialize the data processor with configuration."""
         self.config = self._load_config(config_path)
+        self.youtube_api = YouTubeDataScraper(config_path)
         self._setup_directories()
         # Set up logging
         self.logger = logging.getLogger(__name__)
@@ -23,6 +29,8 @@ class YouTubeDataProcessor:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
+        self._max_workers = min(32, (os.cpu_count() or 1) + 4)  # Optimal number of workers
+        self._chunk_size = 1000  # Process videos in chunks of 1000
 
     def _load_config(self, config_path: str) -> dict:
         """Load configuration from YAML file."""
@@ -103,353 +111,469 @@ class YouTubeDataProcessor:
             self.logger.error(f"Error parsing duration '{duration}': {str(e)}")
             return 0.0
 
-    def generate_analysis_report(self, df: pd.DataFrame, output_dir: str) -> str:
-        """Generate a focused analysis report with specific metrics using all-time data."""
-        if df.empty:
-            return "No data available for analysis."
-
-        os.makedirs(output_dir, exist_ok=True)
+    def generate_analysis_report(self, channel_ids: List[str]) -> None:
+        """
+        Generate a comprehensive analysis report for the given channel IDs using parallel processing.
         
-        # Debug: Print DataFrame structure
-        self.logger.info("DataFrame columns: %s", df.columns.tolist())
-        self.logger.info("DataFrame head:\n%s", df.head())
-        
-        # Extract and process data
-        all_videos = []
-        all_channels = []
-        
-        # Process each channel's data
-        for idx, row in df.iterrows():
-            try:
-                # Debug: Print row data
-                self.logger.info("Processing row %d:", idx)
-                self.logger.info("Channel info keys: %s", row['channel_info'].keys() if isinstance(row['channel_info'], dict) else "Not a dict")
-                self.logger.info("Metrics keys: %s", row['metrics'].keys() if isinstance(row['metrics'], dict) else "Not a dict")
+        Args:
+            channel_ids: List of YouTube channel IDs to analyze
+        """
+        try:
+            self.logger.info(f"Starting analysis report generation for {len(channel_ids)} channels")
+            
+            # Get all channel data in one batch
+            channels_data = self.youtube_api.get_channel_info(channel_ids)
+            if not channels_data:
+                self.logger.error("No channel data retrieved")
+                return
+            
+            # Get all video data in one batch
+            videos_data = self.youtube_api.get_channel_videos(channel_ids)
+            if not videos_data:
+                self.logger.error("No video data retrieved")
+                return
+            
+            # Process channel data
+            channel_df = self.process_comprehensive_channel_data(channels_data, videos_data)
+            if channel_df.empty:
+                self.logger.error("No channel data was successfully processed")
+                return
+            
+            # Process video data for all channels
+            all_videos_data = []
+            video_info = {}  # Dictionary to store video metadata for comment processing
+            
+            for channel_id, channel_videos in videos_data.items():
+                if 'videos' in channel_videos and channel_videos['videos']:
+                    video_df = self.process_comprehensive_video_data(channel_videos)
+                    if not video_df.empty:
+                        all_videos_data.append(video_df)
+                        # Store video metadata for comment processing
+                        for _, row in video_df.iterrows():
+                            video_info[row['id']] = {
+                                'title': row['title'],
+                                'channel_title': row['channel_title'],
+                                'channel_id': row['channel_id']
+                            }
+            
+            # Save combined data files
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = self.config['storage']['processed_data_dir']
+            
+            # Save channel data
+            channel_df.to_csv(
+                os.path.join(output_dir, f"channel_data_{timestamp}.csv"),
+                index=False,
+                encoding='utf-8'
+            )
+            self.logger.info(f"\nChannel data saved to: {os.path.join(output_dir, f'channel_data_{timestamp}.csv')}")
+            
+            # Process and save video data in chunks
+            if all_videos_data:
+                combined_videos_df = pd.DataFrame()
+                chunk_size = self._chunk_size
+                total_videos = sum(len(df) for df in all_videos_data)
                 
-                channel_info = row['channel_info']
-                metrics = row['metrics']
+                # Process each chunk
+                for i in range(0, total_videos, chunk_size):
+                    chunk_dfs = []
+                    remaining = chunk_size
+                    
+                    # Get chunks from each video DataFrame
+                    for df in all_videos_data:
+                        if len(df) == 0:
+                            continue
+                        if remaining <= 0:
+                            break
+                        chunk_size_this_df = min(remaining, len(df))
+                        chunk_dfs.append(df.iloc[:chunk_size_this_df])
+                        df.drop(df.index[:chunk_size_this_df], inplace=True)
+                        remaining -= chunk_size_this_df
+                    
+                    if chunk_dfs:
+                        # Combine chunks and optimize memory
+                        chunk_df = pd.concat(chunk_dfs, ignore_index=True)
+                        chunk_df = self._optimize_dataframe_memory(chunk_df)
+                        
+                        # Append to main DataFrame
+                        if combined_videos_df.empty:
+                            combined_videos_df = chunk_df
+                        else:
+                            combined_videos_df = pd.concat([combined_videos_df, chunk_df], ignore_index=True)
+                        
+                        # Save chunk to CSV
+                        mode = 'w' if i == 0 else 'a'
+                        header = i == 0
+                        chunk_df.to_csv(
+                            os.path.join(output_dir, f"combined_video_data_{timestamp}.csv"),
+                            mode=mode,
+                            header=header,
+                            index=False,
+                            encoding='utf-8'
+                        )
+                        
+                        # Clear memory
+                        del chunk_df
+                        del chunk_dfs
                 
-                # Debug: Print channel info and statistics
-                self.logger.info("Channel info: %s", channel_info)
-                self.logger.info("Channel statistics: %s", channel_info.get('statistics', {}))
+                self.logger.info(f"\nCombined video data saved to: {os.path.join(output_dir, f'combined_video_data_{timestamp}.csv')}")
                 
-                # Get channel's total view count from API
-                channel_total_views = int(channel_info.get('statistics', {}).get('viewCount', 0))
-                self.logger.info(f"Channel total views from API: {channel_total_views:,}")
+                # Log combined video statistics
+                self._log_video_statistics(combined_videos_df)
                 
-                # Get videos only from all_time period
-                channel_videos = []
-                if 'all_time' in metrics and 'videos' in metrics['all_time']:
-                    period_videos = metrics['all_time']['videos']
-                    if isinstance(period_videos, list):
-                        for video in period_videos:
-                            if isinstance(video, dict) and 'snippet' in video:
-                                try:
-                                    # Debug: Print video content details
-                                    content_details = video.get('contentDetails', {})
-                                    self.logger.debug(f"Video content details: {content_details}")
-                                    
-                                    # Safely get video data
-                                    stats = video.get('statistics', {})
-                                    duration = video.get('duration', 'PT0S')
-                                    duration_minutes = self._parse_duration(duration)
-                                    
-                                    # Debug: Log duration parsing
-                                    self.logger.debug(f"Video ID: {video.get('id')}, Raw duration: {duration}, Parsed duration (minutes): {duration_minutes}")
-                                    
-                                    video_data = {
-                                        'channel_id': channel_info.get('id', ''),
-                                        'channel_title': channel_info.get('snippet', {}).get('title', ''),
-                                        'video_id': video.get('id', ''),
-                                        'title': video['snippet'].get('title', ''),
-                                        'published_at': pd.to_datetime(video['snippet'].get('publishedAt', '')),
-                                        'views': int(stats.get('viewCount', 0)),
-                                        'likes': int(stats.get('likeCount', 0)),
-                                        'comments': int(stats.get('commentCount', 0)),
-                                        'shares': int(stats.get('shareCount', 0)),
-                                        'duration_minutes': duration_minutes
-                                    }
-                                    
-                                    # Debug: Log the complete video data
-                                    self.logger.debug(f"Processed video data: {video_data}")
-                                    
-                                    # Calculate engagement rates
-                                    video_data['engagement_rate_per_view'] = (
-                                        (video_data['likes'] + video_data['comments'] + video_data['shares']) / 
-                                        video_data['views'] * 100 if video_data['views'] > 0 else 0
-                                    )
-                                    channel_videos.append(video_data)
-                                    all_videos.append(video_data)
-                                except Exception as e:
-                                    self.logger.warning(f"Error processing video {video.get('id', 'unknown')}: {str(e)}")
-                                    continue
+                # Process comments for all videos
+                video_ids = list(video_info.keys())
+                self.process_video_comments(video_ids, video_info)
+            
+            self.logger.info("\nAnalysis report generation completed")
+            
+        except Exception as e:
+            self.logger.error(f"Error generating analysis report: {str(e)}")
+            raise
 
-                if channel_videos:
-                    # Calculate channel metrics
-                    videos_df = pd.DataFrame(channel_videos)
+    def process_comprehensive_channel_data(self, channels_data: List[Dict], videos_data: Optional[Dict[str, dict]] = None) -> pd.DataFrame:
+        """
+        Process comprehensive channel data into a structured DataFrame.
+        
+        Args:
+            channels_data: List of raw channel data from YouTube API
+            videos_data: Optional dictionary mapping channel IDs to their video data
+            
+        Returns:
+            pd.DataFrame: Processed channel data
+        """
+        try:
+            all_channels_info = []
+            
+            for channel_data in channels_data:
+                channel_id = channel_data['id']
+                
+                # Extract all relevant fields
+                channel_info = {
+                    'channel_id': channel_data['id'],
+                    'etag': channel_data['etag'],
                     
-                    # Debug: Print video duration statistics
-                    self.logger.info(f"Channel {channel_info.get('snippet', {}).get('title', '')} duration stats:")
-                    self.logger.info(f"Mean duration: {videos_df['duration_minutes'].mean():.2f} minutes")
-                    self.logger.info(f"Duration range: {videos_df['duration_minutes'].min():.2f} - {videos_df['duration_minutes'].max():.2f} minutes")
+                    # Snippet information
+                    'title': channel_data['snippet']['title'],
+                    'description': channel_data['snippet']['description'],
+                    'custom_url': channel_data['snippet'].get('customUrl', ''),
+                    'published_at': channel_data['snippet']['publishedAt'],
+                    'country': channel_data['snippet'].get('country', ''),
+                    'default_language': channel_data['snippet'].get('defaultLanguage', ''),
                     
-                    subscriber_count = int(channel_info.get('statistics', {}).get('subscriberCount', 0))
-                    total_engagement = sum(v['likes'] + v['comments'] + v['shares'] for v in channel_videos)
+                    # Content Details
+                    'uploads_playlist_id': channel_data['contentDetails']['relatedPlaylists'].get('uploads', ''),
+                    'likes_playlist_id': channel_data['contentDetails']['relatedPlaylists'].get('likes', ''),
+                    'favorites_playlist_id': channel_data['contentDetails']['relatedPlaylists'].get('favorites', ''),
                     
-                    # Calculate upload frequency
-                    if len(videos_df) >= 2:
-                        first_video = videos_df['published_at'].min()
-                        last_video = videos_df['published_at'].max()
-                        days_between = (last_video - first_video).days
-                        upload_frequency = days_between / (len(videos_df) - 1) if len(videos_df) > 1 else 0
-                    else:
-                        upload_frequency = 0
+                    # Statistics
+                    'view_count': int(channel_data['statistics'].get('viewCount', 0)),
+                    'subscriber_count': int(channel_data['statistics'].get('subscriberCount', 0)),
+                    'hidden_subscriber_count': channel_data['statistics'].get('hiddenSubscriberCount', False),
+                    'video_count': int(channel_data['statistics'].get('videoCount', 0)),
+                    
+                    # Topic Details
+                    'topic_ids': ','.join(channel_data.get('topicDetails', {}).get('topicIds', [])),
+                    'topic_categories': ','.join(channel_data.get('topicDetails', {}).get('topicCategories', [])),
+                    
+                    # Branding Settings
+                    'branding_title': channel_data.get('brandingSettings', {}).get('channel', {}).get('title', ''),
+                    'branding_description': channel_data.get('brandingSettings', {}).get('channel', {}).get('description', ''),
+                    'branding_keywords': channel_data.get('brandingSettings', {}).get('channel', {}).get('keywords', ''),
+                    'branding_tracking_analytics_account_id': channel_data.get('brandingSettings', {}).get('channel', {}).get('trackingAnalyticsAccountId', ''),
+                    'branding_unsubscribed_trailer': channel_data.get('brandingSettings', {}).get('channel', {}).get('unsubscribedTrailer', ''),
+                    'branding_default_language': channel_data.get('brandingSettings', {}).get('channel', {}).get('defaultLanguage', ''),
+                    'branding_country': channel_data.get('brandingSettings', {}).get('channel', {}).get('country', ''),
+                    
+                    # Status
+                    'privacy_status': channel_data.get('status', {}).get('privacyStatus', ''),
+                    'is_linked': channel_data.get('status', {}).get('isLinked', False),
+                    'long_uploads_status': channel_data.get('status', {}).get('longUploadsStatus', ''),
+                    'made_for_kids': channel_data.get('status', {}).get('madeForKids', False),
+                    'self_declared_made_for_kids': channel_data.get('status', {}).get('selfDeclaredMadeForKids', False),
+                    
+                    # Content Owner Details
+                    'content_owner': channel_data.get('contentOwnerDetails', {}).get('contentOwner', ''),
+                    'time_linked': channel_data.get('contentOwnerDetails', {}).get('timeLinked', '')
+                }
+                
+                # Calculate additional metrics if video data is available
+                if videos_data and channel_id in videos_data and 'videos' in videos_data[channel_id]:
+                    videos = videos_data[channel_id]['videos']
+                    video_df = pd.DataFrame(videos)
+                    
+                    # Calculate video metrics
+                    channel_info.update({
+                        # View metrics
+                        'avg_views_per_video': video_df['view_count'].mean(),
+                        'median_views_per_video': video_df['view_count'].median(),
+                        'highest_viewed_video': video_df['view_count'].max(),
+                        'highest_viewed_video_title': video_df.loc[video_df['view_count'].idxmax(), 'title'] if not video_df.empty else '',
+                        
+                        # Engagement metrics
+                        'avg_engagement_rate_per_view': (
+                            (video_df['like_count'] + video_df['comment_count']).sum() / 
+                            video_df['view_count'].sum() * 100 if video_df['view_count'].sum() > 0 else 0
+                        ),
+                        'avg_engagement_rate_per_subscriber': (
+                            (video_df['like_count'] + video_df['comment_count']).sum() / 
+                            channel_info['subscriber_count'] * 100 if channel_info['subscriber_count'] > 0 else 0
+                        ),
+                        
+                        # Content metrics
+                        'avg_video_duration': video_df['duration_seconds'].mean() / 60,  # Convert to minutes
+                        'median_video_duration': video_df['duration_seconds'].median() / 60,  # Convert to minutes
+                        
+                        # Upload frequency
+                        'upload_frequency': self._calculate_upload_frequency(video_df)
+                    })
+                else:
+                    # Set default values if no video data
+                    channel_info.update({
+                        'avg_views_per_video': 0,
+                        'median_views_per_video': 0,
+                        'highest_viewed_video': 0,
+                        'highest_viewed_video_title': '',
+                        'avg_engagement_rate_per_view': 0,
+                        'avg_engagement_rate_per_subscriber': 0,
+                        'avg_video_duration': 0,
+                        'median_video_duration': 0,
+                        'upload_frequency': 0
+                    })
+                
+                all_channels_info.append(channel_info)
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(all_channels_info)
+            
+            # Log some basic statistics
+            self.logger.info("\nChannel Data Statistics:")
+            self.logger.info(f"Total channels processed: {len(df)}")
+            self.logger.info(f"Total subscribers across all channels: {df['subscriber_count'].sum():,}")
+            self.logger.info(f"Total views across all channels: {df['view_count'].sum():,}")
+            self.logger.info(f"Average subscribers per channel: {df['subscriber_count'].mean():,.0f}")
+            self.logger.info(f"Average views per channel: {df['view_count'].mean():,.0f}")
+            
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Error processing comprehensive channel data: {str(e)}")
+            raise
 
-                    # Calculate average views per video using channel's total view count
-                    avg_views_per_video = channel_total_views / int(channel_info.get('statistics', {}).get('videoCount', len(channel_videos)))
+    def _calculate_upload_frequency(self, video_df: pd.DataFrame) -> float:
+        """
+        Calculate the average number of days between video uploads.
+        
+        Args:
+            video_df: DataFrame containing video data with 'published_at' column
+            
+        Returns:
+            float: Average days between uploads
+        """
+        try:
+            if len(video_df) < 2:
+                return 0.0
+                
+            # Convert published_at to datetime if it's not already
+            if not pd.api.types.is_datetime64_any_dtype(video_df['published_at']):
+                video_df['published_at'] = pd.to_datetime(video_df['published_at'])
+            
+            # Sort by published date
+            video_df = video_df.sort_values('published_at')
+            
+            # Calculate time differences between consecutive videos
+            time_diffs = video_df['published_at'].diff().dropna()
+            
+            # Convert to days and calculate mean
+            avg_days = time_diffs.dt.total_seconds().mean() / (24 * 3600)
+            
+            return avg_days
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating upload frequency: {str(e)}")
+            return 0.0
+
+    def process_comprehensive_video_data(self, videos_data: Dict) -> pd.DataFrame:
+        """
+        Process comprehensive video data into a structured DataFrame.
+        
+        Args:
+            videos_data: Dictionary containing video data from YouTube API
+                Expected keys: 'videos' (list of video data), 'categories' (dict of category mappings)
+            
+        Returns:
+            pd.DataFrame: Processed video data
+        """
+        try:
+            if not videos_data or 'videos' not in videos_data:
+                self.logger.warning("No video data provided")
+                return pd.DataFrame()
+            
+            videos = videos_data['videos']
+            if not videos:
+                self.logger.warning("Empty video list")
+                return pd.DataFrame()
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(videos)
+            
+            # Ensure all numeric columns are properly typed
+            numeric_columns = [
+                'view_count', 'like_count', 'dislike_count', 'favorite_count', 'comment_count',
+                'duration_seconds', 'duration_ms', 'bitrate_bps', 'concurrent_viewers',
+                'video_width', 'video_height', 'video_frame_rate', 'video_aspect_ratio',
+                'video_bitrate', 'audio_channel_count', 'audio_bitrate', 'file_size'
+            ]
+            
+            for col in numeric_columns:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            
+            # Ensure boolean columns are properly typed
+            boolean_columns = [
+                'licensed_content', 'has_custom_thumbnail', 'embeddable',
+                'public_stats_viewable', 'made_for_kids'
+            ]
+            
+            for col in boolean_columns:
+                if col in df.columns:
+                    df[col] = df[col].astype(bool)
+            
+            # Ensure datetime columns are properly typed
+            datetime_columns = [
+                'published_at', 'recording_date', 'creation_time',
+                'actual_start_time', 'actual_end_time',
+                'scheduled_start_time', 'scheduled_end_time'
+            ]
+            
+            for col in datetime_columns:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+            
+            # Log some basic statistics
+            self.logger.info("\nVideo Data Statistics:")
+            self.logger.info(f"Total videos processed: {len(df)}")
+            self.logger.info(f"Date range: {df['published_at'].min()} to {df['published_at'].max()}")
+            self.logger.info(f"Total views: {df['view_count'].sum():,}")
+            self.logger.info(f"Average views per video: {df['view_count'].mean():,.0f}")
+            self.logger.info(f"Average duration: {df['duration_seconds'].mean()/60:.1f} minutes")
+            
+            # Log category distribution
+            if 'category_name' in df.columns:
+                category_counts = df['category_name'].value_counts()
+                self.logger.info("\nCategory Distribution:")
+                for category, count in category_counts.items():
+                    self.logger.info(f"{category}: {count} videos")
+            
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Error processing comprehensive video data: {str(e)}")
+            raise
+
+    def _optimize_dataframe_memory(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Optimize DataFrame memory usage by using appropriate data types."""
+        for col in df.columns:
+            # Optimize numeric columns
+            if pd.api.types.is_integer_dtype(df[col]):
+                df[col] = pd.to_numeric(df[col], downcast='integer')
+            elif pd.api.types.is_float_dtype(df[col]):
+                df[col] = pd.to_numeric(df[col], downcast='float')
+            
+            # Optimize string columns
+            elif pd.api.types.is_object_dtype(df[col]):
+                if df[col].nunique() / len(df) < 0.5:  # If less than 50% unique values
+                    df[col] = df[col].astype('category')
+        
+        return df
+
+    def _log_channel_statistics(self, df: pd.DataFrame) -> None:
+        """Log channel statistics."""
+        self.logger.info("\nCombined Channel Data Statistics:")
+        self.logger.info(f"Total channels: {len(df)}")
+        self.logger.info(f"Total subscribers: {df['subscriber_count'].sum():,}")
+        self.logger.info(f"Total views: {df['view_count'].sum():,}")
+        self.logger.info(f"Average subscribers per channel: {df['subscriber_count'].mean():,.0f}")
+        self.logger.info(f"Average views per channel: {df['view_count'].mean():,.0f}")
+
+    def _log_video_statistics(self, df: pd.DataFrame) -> None:
+        """Log video statistics."""
+        self.logger.info("\nCombined Video Data Statistics:")
+        self.logger.info(f"Total videos: {len(df)}")
+        self.logger.info(f"Date range: {df['published_at'].min()} to {df['published_at'].max()}")
+        self.logger.info(f"Total views: {df['view_count'].sum():,}")
+        self.logger.info(f"Average views per video: {df['view_count'].mean():,.0f}")
+        self.logger.info(f"Average duration: {df['duration_seconds'].mean()/60:.1f} minutes")
+        
+        if 'category_name' in df.columns:
+            category_counts = df['category_name'].value_counts()
+            self.logger.info("\nCategory Distribution:")
+            for category, count in category_counts.items():
+                self.logger.info(f"{category}: {count} videos")
+
+    def process_video_comments(self, video_ids: List[str], video_info: Dict[str, Dict]) -> None:
+        """
+        Process and save comments for a list of videos.
+        
+        Args:
+            video_ids: List of video IDs to fetch comments for
+            video_info: Dictionary mapping video IDs to their metadata (title, channel info, etc.)
+        """
+        try:
+            self.logger.info(f"Starting comment processing for {len(video_ids)} videos")
+            
+            # Create a list to store all comment data
+            all_comments_data = []
+            
+            # Process all videos at once
+            for video_id in tqdm(video_ids, desc="Fetching comments"):
+                if video_id not in video_info:
+                    self.logger.warning(f"No metadata found for video {video_id}, skipping")
+                    continue
                     
-                    channel_data = {
-                        'channel_id': channel_info.get('id', ''),
-                        'title': channel_info.get('snippet', {}).get('title', ''),
-                        'subscriber_count': subscriber_count,
-                        'video_count': int(channel_info.get('statistics', {}).get('videoCount', len(channel_videos))),  # Use API's video count
-                        'total_views': channel_total_views,  # Use channel's total views from API
-                        'avg_views_per_video': avg_views_per_video,  # Calculate using total views
-                        'median_views_per_video': videos_df['views'].median(),  # Keep median from sampled videos
-                        'highest_viewed_video': videos_df['views'].max(),  # Keep highest from sampled videos
-                        'avg_engagement_rate_per_view': videos_df['engagement_rate_per_view'].mean(),
-                        'avg_engagement_rate_per_subscriber': (total_engagement / subscriber_count * 100) if subscriber_count > 0 else 0,
-                        'avg_video_duration': videos_df['duration_minutes'].mean(),
-                        'upload_frequency': upload_frequency
+                # Get video metadata
+                video_meta = video_info[video_id]
+                
+                # Fetch comments
+                comments = self.youtube_api.get_video_comments(video_id)
+                
+                if comments:
+                    # Combine all comment texts for this video
+                    comment_texts = [comment['text'] for comment in comments]
+                    combined_comments = ' | '.join(comment_texts)
+                    
+                    # Create a row with video info and combined comments
+                    comment_row = {
+                        'video_title': video_meta['title'],
+                        'video_id': video_id,
+                        'channel_title': video_meta['channel_title'],
+                        'channel_id': video_meta['channel_id'],
+                        'comments': combined_comments,
+                        'comment_count': len(comments)
                     }
-                    
-                    # Debug: Log channel data with views
-                    self.logger.info(f"Channel data - Total views: {channel_data['total_views']:,}, Avg views per video: {channel_data['avg_views_per_video']:,.0f}")
-                    
-                    all_channels.append(channel_data)
-
-            except Exception as e:
-                self.logger.error(f"Error processing channel data: {str(e)}")
-                continue
-
-        # Create DataFrames
-        channels_df = pd.DataFrame(all_channels)
-        videos_df = pd.DataFrame(all_videos)
-
-        # Debug: Print view statistics for all channels
-        self.logger.info("\nOverall view statistics:")
-        self.logger.info(f"Total views across all channels: {channels_df['total_views'].sum():,}")
-        self.logger.info(f"Average views per channel: {channels_df['total_views'].mean():,.0f}")
-        self.logger.info(f"Average views per video across all channels: {channels_df['avg_views_per_video'].mean():,.0f}")
-        
-        # Debug: Print duration statistics for all channels
-        self.logger.info("\nOverall duration statistics:")
-        self.logger.info(f"Mean duration across all channels: {channels_df['avg_video_duration'].mean():.2f} minutes")
-        self.logger.info(f"Duration range across all channels: {channels_df['avg_video_duration'].min():.2f} - {channels_df['avg_video_duration'].max():.2f} minutes")
-        
-        # Debug: Print final DataFrames
-        self.logger.info("\nChannels DataFrame columns: %s", channels_df.columns.tolist())
-        self.logger.info("Channels DataFrame head:\n%s", channels_df.head())
-        self.logger.info("\nVideos DataFrame columns: %s", videos_df.columns.tolist())
-        self.logger.info("Videos DataFrame head:\n%s", videos_df.head())
-
-        if channels_df.empty or videos_df.empty:
-            return "No valid data available for analysis."
-
-        # Generate the report
-        report = []
-        report.append("# YouTube Channel Analysis Report (All-Time Statistics)\n")
-        report.append(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-        # 1. Overall Channel Metrics
-        report.append("## 1. Overall Channel Metrics\n")
-        
-        # a. Channels ranked by subscribers
-        report.append("### a. Channels Ranked by Subscribers")
-        subscriber_rankings = channels_df.sort_values('subscriber_count', ascending=False)
-        for _, channel in subscriber_rankings.iterrows():
-            report.append(f"- **{channel['title']}**: {channel['subscriber_count']:,} subscribers")
-        
-        # b. Channels ranked by total views
-        report.append("\n### b. Channels Ranked by Total Views")
-        view_rankings = channels_df.sort_values('total_views', ascending=False)
-        for _, channel in view_rankings.iterrows():
-            report.append(f"- **{channel['title']}**: {channel['total_views']:,} views")
-        
-        # c-h. Overall averages
-        report.append("\n### Overall Averages Across All Channels")
-        overall_metrics = {
-            'Average Views per Video': f"{channels_df['avg_views_per_video'].mean():,.0f}",
-            'Median Views per Video': f"{channels_df['median_views_per_video'].median():,.0f}",
-            'Average Engagement Rate per Video': f"{channels_df['avg_engagement_rate_per_view'].mean():.2f}%",
-            'Average Engagement Rate per Subscriber': f"{channels_df['avg_engagement_rate_per_subscriber'].mean():.2f}%",
-            'Average Video Duration': f"{channels_df['avg_video_duration'].mean():.1f} minutes",
-            'Average Upload Frequency': f"{channels_df['upload_frequency'].mean():.1f} days between videos"
-        }
-        for metric, value in overall_metrics.items():
-            report.append(f"- **{metric}**: {value}")
-
-        # 2. Individual Channel Analysis
-        report.append("\n## 2. Individual Channel Analysis\n")
-        
-        for _, channel in channels_df.sort_values('subscriber_count', ascending=False).iterrows():
-            report.append(f"### {channel['title']}\n")
+                    all_comments_data.append(comment_row)
             
-            # Basic Channel Information
-            report.append("#### Channel Overview")
-            report.append(f"- **Subscribers**: {channel['subscriber_count']:,}")
-            report.append(f"- **Total Videos**: {channel['video_count']:,}")
-            report.append(f"- **Total Views**: {channel['total_views']:,}")
-            
-            # Channel Performance
-            report.append("\n#### Channel Performance")
-            performance_metrics = {
-                'Average Views per Video': f"{channel['avg_views_per_video']:,.0f}",
-                'Median Views per Video': f"{channel['median_views_per_video']:,.0f}",
-                'Highest Viewed Video': f"{channel['highest_viewed_video']:,.0f}",
-                'Average Engagement Rate per View': f"{channel['avg_engagement_rate_per_view']:.2f}%",
-                'Average Engagement Rate per Subscriber': f"{channel['avg_engagement_rate_per_subscriber']:.2f}%",
-                'Average Video Duration': f"{channel['avg_video_duration']:.1f} minutes",
-                'Upload Frequency': f"{channel['upload_frequency']:.1f} days between videos"
-            }
-            for metric, value in performance_metrics.items():
-                report.append(f"- **{metric}**: {value}")
-            
-            report.append("\n---\n")  # Separator between channels
-
-        # Save the report
-        report_path = os.path.join(output_dir, 'channel_analysis_report.md')
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(report))
-
-        # Save raw data
-        channels_df.to_csv(os.path.join(output_dir, 'channel_analysis.csv'), index=False)
-        videos_df.to_csv(os.path.join(output_dir, 'video_analysis.csv'), index=False)
-
-        self.logger.info(f"Analysis report saved to: {report_path}")
-        self.logger.info(f"Raw data saved to: {output_dir}")
-
-        return '\n'.join(report)
-
-    def _plot_channel_overview(self, df: pd.DataFrame, output_dir: str):
-        """Generate channel overview visualizations."""
-        # Subscriber distribution
-        plt.figure(figsize=(10, 6))
-        sns.barplot(data=df[df['period'] == 'all_time'], 
-                   x='channel_name', 
-                   y='subscriber_count')
-        plt.xticks(rotation=45, ha='right')
-        plt.title('Subscriber Count by Channel')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'subscriber_distribution.png'))
-        plt.close()
-
-        # Views per video
-        plt.figure(figsize=(10, 6))
-        sns.barplot(data=df, 
-                   x='channel_name', 
-                   y='average_views',
-                   hue='period')
-        plt.xticks(rotation=45, ha='right')
-        plt.title('Average Views per Video by Period')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'views_per_video.png'))
-        plt.close()
-
-    def _plot_engagement_analysis(self, df: pd.DataFrame, output_dir: str):
-        """Generate engagement analysis visualizations."""
-        # Engagement rate
-        plt.figure(figsize=(10, 6))
-        sns.barplot(data=df, 
-                   x='channel_name', 
-                   y='engagement_rate',
-                   hue='period')
-        plt.xticks(rotation=45, ha='right')
-        plt.title('Engagement Rate by Channel and Period')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'engagement_rate.png'))
-        plt.close()
-
-        # Likes and comments correlation
-        plt.figure(figsize=(10, 6))
-        sns.scatterplot(data=df[df['period'] == 'all_time'],
-                       x='average_likes',
-                       y='average_comments',
-                       hue='channel_name')
-        plt.title('Likes vs Comments Correlation')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'likes_comments_correlation.png'))
-        plt.close()
-
-    def _plot_content_analysis(self, df: pd.DataFrame, output_dir: str):
-        """Generate content analysis visualizations."""
-        # Video duration distribution
-        plt.figure(figsize=(10, 6))
-        sns.boxplot(data=df,
-                   x='channel_name',
-                   y='average_duration',
-                   hue='period')
-        plt.xticks(rotation=45, ha='right')
-        plt.title('Video Duration Distribution')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'video_duration.png'))
-        plt.close()
-
-        # Upload frequency
-        plt.figure(figsize=(10, 6))
-        sns.barplot(data=df[df['period'] == 'all_time'],
-                   x='channel_name',
-                   y='upload_frequency_days')
-        plt.xticks(rotation=45, ha='right')
-        plt.title('Average Days Between Uploads')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'upload_frequency.png'))
-        plt.close()
-
-    def _generate_summary_stats(self, df: pd.DataFrame, output_dir: str):
-        """Generate summary statistics report."""
-        summary = df.groupby(['channel_name', 'period']).agg({
-            'subscriber_count': 'first',
-            'total_videos': 'first',
-            'average_views': ['mean', 'std'],
-            'average_likes': ['mean', 'std'],
-            'average_comments': ['mean', 'std'],
-            'engagement_rate': ['mean', 'std'],
-            'average_duration': ['mean', 'std'],
-            'upload_frequency_days': 'mean'
-        }).round(2)
-
-        # Save to CSV
-        summary.to_csv(os.path.join(output_dir, 'summary_statistics.csv'))
-
-        # Generate markdown report
-        report = ["# YouTube Channel Analysis Report\n"]
-        report.append("## Summary Statistics\n")
-        report.append(summary.to_markdown())
-        report.append("\n## Key Findings\n")
-        
-        # Add key findings based on the data
-        for channel in df['channel_name'].unique():
-            channel_data = df[df['channel_name'] == channel]
-            report.append(f"\n### {channel}\n")
-            
-            # Add channel-specific insights
-            recent_data = channel_data[channel_data['period'] == 'recent_7_videos'].iloc[0]
-            all_time_data = channel_data[channel_data['period'] == 'all_time'].iloc[0]
-            
-            report.append(f"- Recent Performance (Last 7 videos):")
-            report.append(f"  - Average Views: {recent_data['average_views']:,.0f}")
-            report.append(f"  - Engagement Rate: {recent_data['engagement_rate']:.2%}")
-            report.append(f"  - Average Video Length: {recent_data['average_duration']/60:.1f} minutes")
-            
-            report.append(f"\n- All-Time Performance:")
-            report.append(f"  - Total Subscribers: {all_time_data['subscriber_count']:,.0f}")
-            report.append(f"  - Total Videos: {all_time_data['total_videos']}")
-            report.append(f"  - Average Upload Frequency: {all_time_data['upload_frequency_days']:.1f} days")
-
-        # Save report
-        with open(os.path.join(output_dir, 'analysis_report.md'), 'w') as f:
-            f.write('\n'.join(report))
+            if all_comments_data:
+                # Convert to DataFrame
+                comments_df = pd.DataFrame(all_comments_data)
+                
+                # Save to CSV
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_path = os.path.join(
+                    self.config['storage']['processed_data_dir'],
+                    f"video_comments_{timestamp}.csv"
+                )
+                
+                comments_df.to_csv(output_path, index=False, encoding='utf-8')
+                self.logger.info(f"\nComments data saved to: {output_path}")
+                self.logger.info(f"Total videos processed: {len(comments_df)}")
+                self.logger.info(f"Total comments collected: {comments_df['comment_count'].sum():,}")
+            else:
+                self.logger.warning("No comments were collected for any videos")
+                
+        except Exception as e:
+            self.logger.error(f"Error processing video comments: {str(e)}")
+            raise
 
 if __name__ == "__main__":
     # Example usage
