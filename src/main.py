@@ -50,6 +50,7 @@ def get_channel_id(scraper: YouTubeDataScraper, channel_config: Dict) -> str:
 
 def main():
     """Main function to run the YouTube channel analysis."""
+    logger = setup_logging()
     logger.info("Starting YouTube channel analysis")
     
     try:
@@ -63,36 +64,14 @@ def main():
             logger.error("No channels configured for analysis")
             return
         
-        # Process each channel
-        all_data = []
-        for channel in tqdm(channels, desc="Analyzing channels"):
-            try:
-                channel_id = channel['id']
-                logger.info(f"Processing channel: {channel['name']} (ID: {channel_id})")
-                
-                # Get channel data
-                channel_data = scraper.analyze_channel(channel_id)
-                if channel_data:
-                    # Convert channel data to DataFrame
-                    channel_df = pd.DataFrame([channel_data])
-                    all_data.append(channel_df)
-                else:
-                    logger.warning(f"No data retrieved for channel: {channel_id}")
-                    
-            except Exception as e:
-                logger.error(f"Error processing channel {channel.get('name', 'Unknown')}: {str(e)}")
-                continue
+        # Extract channel IDs
+        channel_ids = [channel['id'] for channel in channels]
+        logger.info(f"Processing {len(channel_ids)} channels")
         
-        if not all_data:
-            logger.error("No channel data was successfully processed")
-            return
-            
-        # Combine all channel data
-        combined_data = pd.concat(all_data, ignore_index=True)
+        # Generate analysis report using batch processing
+        processor.generate_analysis_report(channel_ids)
         
-        # Generate analysis report
-        output_dir = "analysis_results"
-        processor.generate_analysis_report(combined_data, output_dir)
+        logger.info("Analysis complete")
         
     except Exception as e:
         logger.error(f"An error occurred during analysis: {str(e)}")
