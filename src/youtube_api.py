@@ -10,10 +10,15 @@ from tqdm import tqdm
 
 class YouTubeDataScraper:
     def __init__(self, config_path: str = "config/config.yaml"):
-        """Initialize the YouTube Data Scraper with configuration."""
+        """Initialize the YouTube API client."""
         self.config = self._load_config(config_path)
         self.youtube = self._build_youtube_client()
-        self.logger = self._setup_logger()
+        self.logger = logging.getLogger(__name__)
+        self._video_categories_cache = None  # Cache for video categories
+        self._last_api_call = 0  # Track last API call time for rate limiting
+        self._min_api_interval = 0.1  # Minimum time between API calls (100ms)
+        self._max_retries = 3  # Maximum number of retries for API calls
+        self._retry_delay = 1  # Initial retry delay in seconds
 
     def _load_config(self, config_path: str) -> dict:
         """Load configuration from YAML file."""
@@ -37,89 +42,221 @@ class YouTubeDataScraper:
         logger.addHandler(handler)
         return logger
 
-    def get_channel_info(self, channel_id: str) -> dict:
+    def _rate_limit(self):
+        """Implement rate limiting for API calls."""
+        current_time = time.time()
+        time_since_last_call = current_time - self._last_api_call
+        if time_since_last_call < self._min_api_interval:
+            time.sleep(self._min_api_interval - time_since_last_call)
+        self._last_api_call = time.time()
+
+    def _make_api_request(self, request_func, *args, **kwargs):
+        """Make an API request with retry logic and rate limiting."""
+        for attempt in range(self._max_retries):
+            try:
+                self._rate_limit()
+                return request_func(*args, **kwargs).execute()
+            except HttpError as e:
+                if e.resp.status in [429, 500, 502, 503, 504]:  # Rate limit or server errors
+                    if attempt < self._max_retries - 1:
+                        delay = self._retry_delay * (2 ** attempt)  # Exponential backoff
+                        self.logger.warning(f"API request failed (attempt {attempt + 1}/{self._max_retries}). Retrying in {delay:.1f} seconds...")
+                        time.sleep(delay)
+                        continue
+                self.logger.error(f"API request failed after {self._max_retries} attempts: {str(e)}")
+                raise
+            except Exception as e:
+                self.logger.error(f"Unexpected error during API request: {str(e)}")
+                raise
+
+    def get_channel_info(self, channel_ids: Union[str, List[str]]) -> List[dict]:
         """
-        Get channel information using channel ID.
+        Get comprehensive channel information using channel ID(s).
         
         Args:
-            channel_id: YouTube channel ID
+            channel_ids: Single channel ID or list of channel IDs
             
         Returns:
-            dict: Channel information
+            List[dict]: List of channel information including all specified fields
         """
         try:
-            request = self.youtube.channels().list(
-                part="snippet,statistics,contentDetails",
-                id=channel_id
-            )
-            response = request.execute()
-            
-            if not response.get('items'):
-                raise ValueError(f"Channel not found: {channel_id}")
-                
-            return response['items'][0]
-            
+            if isinstance(channel_ids, str):
+                channel_ids = [channel_ids]
+            batch_size = 50
+            all_channels = []
+            for i in range(0, len(channel_ids), batch_size):
+                batch_ids = channel_ids[i:i + batch_size]
+                next_page_token = None
+                while True:
+                    response = self._make_api_request(
+                        self.youtube.channels().list,
+                        part="snippet,contentDetails,statistics,topicDetails,brandingSettings,status,contentOwnerDetails,localizations",
+                        id=','.join(batch_ids),
+                        pageToken=next_page_token,
+                        maxResults=50
+                    )
+                    if not response.get('items'):
+                        if not all_channels:
+                            self.logger.warning(f"No channels found for IDs: {batch_ids}")
+                        break
+                    all_channels.extend(response['items'])
+                    page_info = response.get('pageInfo', {})
+                    self.logger.info(f"Retrieved page with {len(response['items'])} items. Total results: {page_info.get('totalResults', 'unknown')}, Results per page: {page_info.get('resultsPerPage', 'unknown')}")
+                    next_page_token = response.get('nextPageToken')
+                    if not next_page_token:
+                        break
+            self.logger.info(f"Retrieved {len(all_channels)} channel(s) for {len(channel_ids)} channel ID(s)")
+            return all_channels
         except Exception as e:
-            self.logger.error(f"Error getting channel info for {channel_id}: {str(e)}")
+            self.logger.error(f"Error getting channel info: {str(e)}")
             raise
 
-    def get_channel_videos(self, channel_id: str, max_results: int = 50) -> dict:
-        """Get videos from a channel with their statistics."""
+    def get_video_categories(self) -> Dict[str, str]:
+        """
+        Get video category IDs and their names with caching.
+        
+        Returns:
+            Dict[str, str]: Dictionary mapping category IDs to their names
+        """
+        if self._video_categories_cache is not None:
+            return self._video_categories_cache
+
         try:
-            # First get channel's uploads playlist ID
-            channel_response = self.youtube.channels().list(
-                part='contentDetails',
-                id=channel_id
-            ).execute()
+            # Get categories for US region (most comprehensive)
+            response = self._make_api_request(
+                self.youtube.videoCategories().list,
+                part='snippet',
+                regionCode='US'
+            )
             
-            if not channel_response['items']:
-                self.logger.warning(f"No channel found with ID: {channel_id}")
-                return {}
+            categories = {}
+            for item in response.get('items', []):
+                categories[item['id']] = item['snippet']['title']
             
-            uploads_playlist_id = channel_response['items'][0]['contentDetails']['relatedPlaylists']['uploads']
-            
-            # Get videos from the uploads playlist
-            videos = []
-            next_page_token = None
-            
-            while len(videos) < max_results:
-                playlist_response = self.youtube.playlistItems().list(
-                    part='snippet,contentDetails',
-                    playlistId=uploads_playlist_id,
-                    maxResults=min(50, max_results - len(videos)),
-                    pageToken=next_page_token
-                ).execute()
-                
-                video_ids = [item['contentDetails']['videoId'] for item in playlist_response['items']]
-                
-                # Get detailed video statistics including share count
-                video_response = self.youtube.videos().list(
-                    part='snippet,statistics,contentDetails',
-                    id=','.join(video_ids)
-                ).execute()
-                
-                for video in video_response['items']:
-                    video_data = {
-                        'id': video['id'],
-                        'snippet': video['snippet'],
-                        'statistics': {
-                            'viewCount': video['statistics'].get('viewCount', '0'),
-                            'likeCount': video['statistics'].get('likeCount', '0'),
-                            'commentCount': video['statistics'].get('commentCount', '0'),
-                            'shareCount': video['statistics'].get('shareCount', '0'),  # Added share count
-                        },
-                        'duration': video['contentDetails'].get('duration', 'PT0S')
-                    }
-                    videos.append(video_data)
-                
-                next_page_token = playlist_response.get('nextPageToken')
-                if not next_page_token:
-                    break
-            
-            return {'videos': videos}
+            self._video_categories_cache = categories
+            self.logger.info(f"Retrieved and cached {len(categories)} video categories")
+            return categories
             
         except Exception as e:
-            self.logger.error(f"Error fetching videos for channel {channel_id}: {str(e)}")
+            self.logger.error(f"Error fetching video categories: {str(e)}")
+            return {}
+
+    def get_channel_videos(self, channel_ids: Union[str, List[str]], max_results: int = None) -> Dict[str, dict]:
+        """
+        Get all videos from multiple channels' uploads playlists.
+        
+        Args:
+            channel_ids: Single channel ID or list of channel IDs
+            max_results: Optional maximum number of videos to retrieve per channel
+            
+        Returns:
+            Dict[str, dict]: Dictionary mapping channel IDs to their video data
+        """
+        try:
+            if isinstance(channel_ids, str):
+                channel_ids = [channel_ids]
+            categories = self.get_video_categories()
+            channel_response = self._make_api_request(
+                self.youtube.channels().list,
+                part='contentDetails',
+                id=','.join(channel_ids)
+            )
+            if not channel_response.get('items'):
+                self.logger.error(f"No channels found for IDs: {channel_ids}")
+                return {}
+            channel_playlists = {
+                item['id']: item['contentDetails']['relatedPlaylists']['uploads']
+                for item in channel_response['items']
+            }
+            all_videos_data = {}
+            batch_size = 50
+            for channel_id, uploads_playlist_id in channel_playlists.items():
+                self.logger.info(f"Processing videos for channel {channel_id}")
+                videos = []
+                next_page_token = None
+                total_retrieved = 0
+                while True:
+                    if max_results:
+                        remaining = max_results - total_retrieved
+                        if remaining <= 0:
+                            break
+                        current_max = min(batch_size, remaining)
+                    else:
+                        current_max = batch_size
+                    playlist_response = self._make_api_request(
+                        self.youtube.playlistItems().list,
+                        part='snippet,contentDetails',
+                        playlistId=uploads_playlist_id,
+                        maxResults=current_max,
+                        pageToken=next_page_token
+                    )
+                    if not playlist_response.get('items'):
+                        break
+                    video_ids = [item['contentDetails']['videoId'] for item in playlist_response['items']]
+                    for i in range(0, len(video_ids), batch_size):
+                        batch_ids = video_ids[i:i + batch_size]
+                        video_response = self._make_api_request(
+                            self.youtube.videos().list,
+                            part='snippet,contentDetails,statistics,status,topicDetails,localizations',
+                            id=','.join(batch_ids)
+                        )
+                        for video in video_response.get('items', []):
+                            category_id = video['snippet'].get('categoryId', '')
+                            category_name = categories.get(category_id, 'Unknown')
+                            video_data = {
+                                'id': video['id'],
+                                'etag': video['etag'],
+                                'title': video['snippet']['title'],
+                                'description': video['snippet']['description'],
+                                'published_at': video['snippet']['publishedAt'],
+                                'channel_id': video['snippet']['channelId'],
+                                'channel_title': video['snippet']['channelTitle'],
+                                'tags': ','.join(video['snippet'].get('tags', [])),
+                                'category_id': category_id,
+                                'category_name': category_name,
+                                'live_broadcast_content': video['snippet'].get('liveBroadcastContent', 'none'),
+                                'default_language': video['snippet'].get('defaultLanguage', ''),
+                                'default_audio_language': video['snippet'].get('defaultAudioLanguage', ''),
+                                'duration': video['contentDetails'].get('duration', 'PT0S'),
+                                'duration_seconds': self._parse_duration(video['contentDetails'].get('duration', 'PT0S')),
+                                'dimension': video['contentDetails'].get('dimension', ''),
+                                'definition': video['contentDetails'].get('definition', ''),
+                                'caption': video['contentDetails'].get('caption', ''),
+                                'licensed_content': video['contentDetails'].get('licensedContent', False),
+                                'projection': video['contentDetails'].get('projection', ''),
+                                'has_custom_thumbnail': video['contentDetails'].get('hasCustomThumbnail', False),
+                                'view_count': int(video['statistics'].get('viewCount', 0)),
+                                'like_count': int(video['statistics'].get('likeCount', 0)),
+                                'dislike_count': int(video['statistics'].get('dislikeCount', 0)),
+                                'favorite_count': int(video['statistics'].get('favoriteCount', 0)),
+                                'comment_count': int(video['statistics'].get('commentCount', 0)),
+                                'privacy_status': video.get('status', {}).get('privacyStatus', ''),
+                                'upload_status': video.get('status', {}).get('uploadStatus', ''),
+                                'license': video.get('status', {}).get('license', ''),
+                                'embeddable': video.get('status', {}).get('embeddable', False),
+                                'public_stats_viewable': video.get('status', {}).get('publicStatsViewable', False),
+                                'made_for_kids': video.get('status', {}).get('madeForKids', False),
+                                'topic_ids': ','.join(video.get('topicDetails', {}).get('topicIds', [])),
+                                'topic_categories': ','.join(video.get('topicDetails', {}).get('topicCategories', []))
+                            }
+                            videos.append(video_data)
+                    total_retrieved += len(video_ids)
+                    self.logger.info(f"Retrieved {len(video_ids)} videos for channel {channel_id}. Total so far: {total_retrieved}")
+                    if max_results and total_retrieved >= max_results:
+                        break
+                    next_page_token = playlist_response.get('nextPageToken')
+                    if not next_page_token:
+                        break
+                self.logger.info(f"Successfully retrieved {len(videos)} videos for channel {channel_id}")
+                all_videos_data[channel_id] = {
+                    'videos': videos,
+                    'total_retrieved': len(videos),
+                    'playlist_id': uploads_playlist_id,
+                    'categories': categories
+                }
+            return all_videos_data
+        except Exception as e:
+            self.logger.error(f"Error fetching videos: {str(e)}")
             return {}
 
     def get_video_details(self, video_id: str) -> Optional[Dict]:
@@ -292,6 +429,82 @@ class YouTubeDataScraper:
         except HttpError as e:
             self.logger.error(f"Error fetching channel ID: {e}")
             return None
+
+    def get_video_comments(self, video_id: str) -> List[Dict]:
+        """
+        Get all comments for a specific video.
+        
+        Args:
+            video_id: The ID of the video to fetch comments for
+            
+        Returns:
+            List[Dict]: List of comment data including text, author, and metadata
+        """
+        try:
+            comments = []
+            next_page_token = None
+            
+            while True:
+                try:
+                    response = self._make_api_request(
+                        self.youtube.commentThreads().list,
+                        part='snippet,replies',
+                        videoId=video_id,
+                        maxResults=100,  # Maximum allowed by API
+                        pageToken=next_page_token,
+                        textFormat='plainText'
+                    )
+                    
+                    if not response.get('items'):
+                        break
+                        
+                    for item in response['items']:
+                        comment = item['snippet']['topLevelComment']['snippet']
+                        comment_data = {
+                            'comment_id': item['id'],
+                            'video_id': video_id,
+                            'author_display_name': comment['authorDisplayName'],
+                            'author_channel_id': comment.get('authorChannelId', {}).get('value', ''),
+                            'text': comment['textDisplay'],
+                            'like_count': int(comment.get('likeCount', 0)),
+                            'published_at': comment['publishedAt'],
+                            'updated_at': comment['updatedAt']
+                        }
+                        comments.append(comment_data)
+                        
+                        # Get replies if any
+                        if item.get('replies'):
+                            for reply in item['replies']['comments']:
+                                reply_snippet = reply['snippet']
+                                reply_data = {
+                                    'comment_id': reply['id'],
+                                    'video_id': video_id,
+                                    'parent_id': item['id'],
+                                    'author_display_name': reply_snippet['authorDisplayName'],
+                                    'author_channel_id': reply_snippet.get('authorChannelId', {}).get('value', ''),
+                                    'text': reply_snippet['textDisplay'],
+                                    'like_count': int(reply_snippet.get('likeCount', 0)),
+                                    'published_at': reply_snippet['publishedAt'],
+                                    'updated_at': reply_snippet['updatedAt']
+                                }
+                                comments.append(reply_data)
+                    
+                    next_page_token = response.get('nextPageToken')
+                    if not next_page_token:
+                        break
+                        
+                except HttpError as e:
+                    if e.resp.status == 403:  # Comments disabled
+                        self.logger.warning(f"Comments are disabled for video {video_id}")
+                        break
+                    raise
+                    
+            self.logger.info(f"Retrieved {len(comments)} comments for video {video_id}")
+            return comments
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching comments for video {video_id}: {str(e)}")
+            return []
 
 if __name__ == "__main__":
     # Example usage
